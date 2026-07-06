@@ -28,6 +28,9 @@ jobs:
       - name: Build meme gallery
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          REDDIT_CLIENT_ID: ${{ secrets.REDDIT_CLIENT_ID }}
+          REDDIT_CLIENT_SECRET: ${{ secrets.REDDIT_CLIENT_SECRET }}
+          YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
         run: python scripts/build.py
 
       - name: Commit and push
@@ -51,5 +54,5 @@ jobs:
             -H "Title: Meme Radar $(TZ=Europe/Bratislava date +%d.%m.)" \
             -H "Click: https://chrisvalachovic.github.io/meme-radar/" \
             -H "Tags: fire" \
-            -d "$COUNT novych memes ta caka v galerii" \
+            -d "V galerii ta caka: $COUNT" \
             "https://ntfy.sh/$NTFY_TOPIC" > /dev/null

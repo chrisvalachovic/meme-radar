@@ -37,6 +37,14 @@ SEEN_DAYS = 30       # ako dlho drzat dedup historiu
 KYM_LIMIT = 5
 IMGFLIP_LIMIT = 10
 
+VIDEO_SUBS = ["TikTokCringe", "Unexpected", "ContagiousLaughter",
+              "funnyvideos", "PerfectlyCutScreams", "AbruptChaos"]
+VIDEO_PER_SUB = 10
+MAX_VIDEOS = 10
+MIN_VIDEO_UPS = 200
+YT_LIMIT = 6
+VIDEO_DOMAINS = ("v.redd.it", "youtube.com", "youtu.be", "streamable.com", "tiktok.com")
+
 UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 meme-radar/1.0"}
 
 
@@ -105,6 +113,120 @@ def fetch_kym(client: httpx.Client) -> list[dict]:
         return []
 
 
+def fetch_reddit_videos(client: httpx.Client) -> list[dict]:
+    """Top video memes dna z Reddit video subov (app-only OAuth, fail-soft)."""
+    cid = os.environ.get("REDDIT_CLIENT_ID")
+    secret = os.environ.get("REDDIT_CLIENT_SECRET")
+    if not cid or not secret:
+        print("[warn] REDDIT_CLIENT_ID/SECRET nie su nastavene — video sekcia (Reddit) vypadne", file=sys.stderr)
+        return []
+    try:
+        tok = client.post(
+            "https://www.reddit.com/api/v1/access_token",
+            auth=(cid, secret),
+            data={"grant_type": "client_credentials"},
+            headers=UA,
+        )
+        tok.raise_for_status()
+        token = tok.json()["access_token"]
+    except Exception as e:
+        print(f"[warn] Reddit OAuth token zlyhal: {e}", file=sys.stderr)
+        return []
+
+    headers = {**UA, "Authorization": f"Bearer {token}"}
+    videos = []
+    for sub in VIDEO_SUBS:
+        try:
+            r = client.get(
+                f"https://oauth.reddit.com/r/{sub}/top",
+                params={"t": "day", "limit": VIDEO_PER_SUB, "raw_json": 1},
+                headers=headers,
+            )
+            r.raise_for_status()
+            for child in r.json()["data"]["children"]:
+                d = child["data"]
+                if d.get("over_18") or d.get("stickied"):
+                    continue
+                domain = d.get("domain", "")
+                if not (d.get("is_video") or any(v in domain for v in VIDEO_DOMAINS)):
+                    continue
+                thumb = None
+                try:
+                    thumb = html.unescape(d["preview"]["images"][0]["source"]["url"])
+                except (KeyError, IndexError):
+                    t = d.get("thumbnail", "")
+                    if t.startswith("http"):
+                        thumb = t
+                if not thumb:
+                    continue
+                videos.append({
+                    "id": d["id"],
+                    "title": d.get("title", ""),
+                    "thumb": thumb,
+                    "link": f"https://www.reddit.com{d.get('permalink', '')}",
+                    "source": f"r/{d.get('subreddit', sub)}",
+                    "ups": d.get("ups", 0),
+                })
+        except Exception as e:
+            print(f"[warn] Reddit video r/{sub} zlyhal: {e}", file=sys.stderr)
+    return videos
+
+
+def _iso_duration_seconds(dur: str) -> int:
+    """Parse ISO 8601 trvanie typu PT1M23S na sekundy."""
+    import re
+    m = re.fullmatch(r"PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?", dur or "")
+    if not m:
+        return 10**6
+    h, mi, s = (int(x) if x else 0 for x in m.groups())
+    return h * 3600 + mi * 60 + s
+
+
+def fetch_youtube(client: httpx.Client) -> list[dict]:
+    """Trending comedy videa/Shorts z YouTube Data API (fail-soft)."""
+    key = os.environ.get("YOUTUBE_API_KEY")
+    if not key:
+        print("[warn] YOUTUBE_API_KEY nie je nastaveny — video sekcia (YouTube) vypadne", file=sys.stderr)
+        return []
+    try:
+        r = client.get(
+            "https://www.googleapis.com/youtube/v3/videos",
+            params={
+                "part": "snippet,contentDetails,statistics",
+                "chart": "mostPopular",
+                "regionCode": "US",
+                "videoCategoryId": "23",  # Comedy
+                "maxResults": 15,
+                "key": key,
+            },
+        )
+        r.raise_for_status()
+        items = []
+        for v in r.json().get("items", []):
+            secs = _iso_duration_seconds(v.get("contentDetails", {}).get("duration", ""))
+            sn = v.get("snippet", {})
+            thumbs = sn.get("thumbnails", {})
+            thumb = (thumbs.get("high") or thumbs.get("medium") or thumbs.get("default") or {}).get("url")
+            if not thumb:
+                continue
+            items.append({
+                "id": f"yt_{v['id']}",
+                "title": sn.get("title", ""),
+                "thumb": thumb,
+                "link": f"https://www.youtube.com/watch?v={v['id']}",
+                "source": f"YouTube · {sn.get('channelTitle', '')}",
+                "ups": int(v.get("statistics", {}).get("viewCount", 0)),
+                "secs": secs,
+            })
+        shorts = [i for i in items if i["secs"] <= 60]
+        if len(shorts) < 4:
+            shorts = [i for i in items if i["secs"] <= 180]
+        return shorts[:YT_LIMIT]
+    except Exception as e:
+        print(f"[warn] YouTube API zlyhal: {e}", file=sys.stderr)
+        return []
+
+
 def fetch_imgflip(client: httpx.Client) -> list[dict]:
     """Najpouzivanejsie meme templaty z Imgflip (bez auth)."""
     try:
@@ -154,6 +276,24 @@ def select_memes(candidates: list[dict], seen: dict) -> list[dict]:
             if len(fresh) >= MAX_MEMES:
                 break
     return fresh
+
+
+def select_videos(reddit_videos: list[dict], yt_videos: list[dict], seen: dict) -> list[dict]:
+    """Reddit videa podla upvotes + YouTube trending, dedup cez seen.json."""
+    out, ids = [], set()
+    for v in sorted(reddit_videos, key=lambda x: x["ups"], reverse=True):
+        if v["id"] in seen or v["id"] in ids or v["ups"] < MIN_VIDEO_UPS:
+            continue
+        ids.add(v["id"])
+        out.append(v)
+        if len(out) >= MAX_VIDEOS:
+            break
+    for v in yt_videos:
+        if v["id"] in seen or v["id"] in ids:
+            continue
+        ids.add(v["id"])
+        out.append(v)
+    return out
 
 
 # ---------------------------------------------------------------- AI komentare
@@ -240,6 +380,11 @@ h2 { font-size: 1.1rem; margin: 28px 0 12px; padding-bottom: 6px; border-bottom:
 .ai { margin-top: 10px; padding: 10px 12px; background: #1f1f29; border-left: 3px solid #f5a623;
       border-radius: 0 8px 8px 0; font-size: .9rem; line-height: 1.45; }
 .ai .idea { margin-top: 6px; color: #ffd27f; }
+.vid { position: relative; display: block; }
+.vid .play { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+             width: 56px; height: 56px; border-radius: 50%; background: rgba(0,0,0,.55);
+             display: flex; align-items: center; justify-content: center; font-size: 24px;
+             pointer-events: none; }
 .trend { display: flex; gap: 12px; align-items: center; background: #18181f; border: 1px solid #26262e;
          border-radius: 12px; padding: 10px; margin-bottom: 10px; }
 .trend img { width: 72px; height: 72px; object-fit: cover; border-radius: 8px; flex-shrink: 0; }
@@ -258,7 +403,8 @@ def esc(s: str) -> str:
     return html.escape(s or "", quote=True)
 
 
-def render_page(memes: list[dict], trends: list[dict], templates: list[dict], archive_links: list[str]) -> str:
+def render_page(memes: list[dict], videos: list[dict], trends: list[dict],
+                templates: list[dict], archive_links: list[str]) -> str:
     parts = [
         "<!doctype html><html lang='sk'><head><meta charset='utf-8'>",
         "<meta name='viewport' content='width=device-width, initial-scale=1'>",
@@ -286,6 +432,21 @@ def render_page(memes: list[dict], trends: list[dict], templates: list[dict], ar
                 parts.append(f"<div class='idea'>💡 {esc(m['napad'])}</div>")
             parts.append("</div>")
         parts.append("</div></div>")
+
+    if videos:
+        parts.append(f"<h2>🎬 Video memes dňa ({len(videos)})</h2>")
+        for v in videos:
+            meta = f"{esc(v['source'])}"
+            if v["source"].startswith("r/"):
+                meta += f" · ⬆️ {v['ups']:,}"
+            parts.append("<div class='card'>")
+            parts.append(f"<a class='vid' href='{esc(v['link'])}'>"
+                         f"<img src='{esc(v['thumb'])}' alt='{esc(v['title'])}' loading='lazy'>"
+                         f"<span class='play'>▶️</span></a>")
+            parts.append("<div class='body'>")
+            parts.append(f"<div class='title'>{esc(v['title'])}</div>")
+            parts.append(f"<div class='meta'>{meta} · <a href='{esc(v['link'])}'>pozrieť video</a></div>")
+            parts.append("</div></div>")
 
     if trends:
         parts.append("<h2>Trendujúce formáty (Know Your Meme)</h2>")
@@ -330,30 +491,34 @@ def main() -> int:
 
     with httpx.Client(timeout=30) as client:
         candidates = fetch_reddit(client)
+        reddit_videos = fetch_reddit_videos(client)
+        yt_videos = fetch_youtube(client)
         trends = fetch_kym(client)
         templates = fetch_imgflip(client)
 
-    print(f"[info] kandidatov z Redditu: {len(candidates)}, KYM trendov: {len(trends)}, Imgflip templatov: {len(templates)}")
+    print(f"[info] kandidatov z Redditu: {len(candidates)}, video kandidatov: {len(reddit_videos)}+{len(yt_videos)}, "
+          f"KYM trendov: {len(trends)}, Imgflip templatov: {len(templates)}")
 
     seen = prune_seen(load_seen())
     memes = select_memes(candidates, seen)
-    print(f"[info] vybranych memes po dedupe: {len(memes)}")
+    videos = select_videos(reddit_videos, yt_videos, seen)
+    print(f"[info] vybranych po dedupe: {len(memes)} memes, {len(videos)} videi")
 
     ai_comments(memes)
 
-    page = render_page(memes, trends, templates, [])
+    page = render_page(memes, videos, trends, templates, [])
     (DOCS / "index.html").write_text(page, encoding="utf-8")
     (ARCHIVE / f"{DATE_ISO}.html").write_text(page, encoding="utf-8")
 
     dates = [p.stem for p in ARCHIVE.glob("????-??-??.html")]
     (ARCHIVE / "index.html").write_text(render_archive_index(dates), encoding="utf-8")
 
-    for m in memes:
-        seen[m["id"]] = DATE_ISO
+    for item in memes + videos:
+        seen[item["id"]] = DATE_ISO
     SEEN_FILE.write_text(json.dumps(seen, indent=1), encoding="utf-8")
-    (DATA / "last_count.txt").write_text(str(len(memes)), encoding="utf-8")
+    (DATA / "last_count.txt").write_text(f"{len(memes)} memes + {len(videos)} videí", encoding="utf-8")
 
-    print(f"[ok] galeria vygenerovana: {len(memes)} memes -> docs/index.html")
+    print(f"[ok] galeria vygenerovana: {len(memes)} memes, {len(videos)} videi -> docs/index.html")
     return 0
 
 
