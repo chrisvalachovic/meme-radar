@@ -1,0 +1,55 @@
+name: meme-radar-daily
+
+on:
+  schedule:
+    - cron: "15 4 * * *"   # ~06:15 CEST (GitHub cron mesva, realne skor ~06:30-07:00)
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: meme-radar
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Build meme gallery
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: python scripts/build.py
+
+      - name: Commit and push
+        run: |
+          git config user.name "meme-radar-bot"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add docs data
+          if [[ -n "$(git status --porcelain)" ]]; then
+            git commit -m "build: meme radar $(date -u +%F)"
+            git push
+          else
+            echo "nothing to commit"
+          fi
+
+      - name: Push notification (ntfy)
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+        run: |
+          COUNT=$(cat data/last_count.txt 2>/dev/null || echo "?")
+          curl -s \
+            -H "Title: Meme Radar $(TZ=Europe/Bratislava date +%d.%m.)" \
+            -H "Click: https://chrisvalachovic.github.io/meme-radar/" \
+            -H "Tags: fire" \
+            -d "$COUNT novych memes ta caka v galerii" \
+            "https://ntfy.sh/$NTFY_TOPIC" > /dev/null
